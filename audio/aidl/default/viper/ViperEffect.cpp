@@ -45,8 +45,9 @@ static const char* kViperLibPaths[] = {
     "/system/lib/soundfx/libv4a_re.so"
 };
 
+// create_effect() matches the implementation UUID (kEffectImplUuidViper), not the type UUID.
 static const effect_uuid_t kViperUuid = {
-    0x41d3c987, 0xe6cf, 0x11e3, 0xa88a, {0x11, 0xab, 0xa5, 0xd5, 0xc5, 0x1b}
+    0x90380da3, 0x8536, 0x4744, 0xa6a3, {0x57, 0x31, 0x97, 0x0e, 0x64, 0x0f}
 };
 
 extern "C" binder_exception_t createEffect(const AudioUuid* in_impl_uuid,
@@ -189,7 +190,29 @@ ndk::ScopedAStatus ViperEffect::getParameterSpecific(const Parameter::Id& id,
 
     VendorExtension extension;
     DefaultExtension defaultExt;
-    defaultExt.bytes = mContext->getParams(defaultIdExt->bytes);
+    // The id is a whole effect_param_t (vsize = room for the value); the app reads its status
+    // and settings back from the engine, so ask libv4a_re instead of echoing the last SET_PARAM.
+    const auto& cmd = defaultIdExt->bytes;
+    if (mLegacyHandle && cmd.size() >= sizeof(effect_param_t)) {
+        const auto* p = reinterpret_cast<const effect_param_t*>(cmd.data());
+        const size_t paddedPSize = (static_cast<size_t>(p->psize) + 3) & ~static_cast<size_t>(3);
+        RETURN_IF(p->psize > cmd.size() - sizeof(effect_param_t) || p->vsize > 65536,
+                  EX_ILLEGAL_ARGUMENT, "badParamSize");
+        // libv4a_re picks the value size itself (up to the config dump and the disable message)
+        // and does not check the reply capacity, so leave headroom beyond the caller's vsize.
+        std::vector<uint8_t> reply(sizeof(effect_param_t) + paddedPSize +
+                                   std::max<size_t>(p->vsize, 1024));
+        uint32_t replySize = reply.size();
+        int ret = (*mLegacyHandle)->command(mLegacyHandle, EFFECT_CMD_GET_PARAM, cmd.size(),
+                                            const_cast<uint8_t*>(cmd.data()), &replySize,
+                                            reply.data());
+        RETURN_IF(ret != 0 || replySize < sizeof(effect_param_t) || replySize > reply.size(),
+                  EX_ILLEGAL_ARGUMENT, "legacyGetParamFailed");
+        reply.resize(replySize);
+        defaultExt.bytes = std::move(reply);
+    } else {
+        defaultExt.bytes = mContext->getParams(defaultIdExt->bytes);
+    }
     RETURN_IF(STATUS_OK != extension.extension.setParcelable(defaultExt), EX_ILLEGAL_ARGUMENT,
               "setParcelableFailed");
     specific->set<Parameter::Specific::vendorEffect>(extension);
@@ -215,7 +238,13 @@ std::shared_ptr<EffectContext> ViperEffect::createContext(const Parameter::Commo
             LOG(INFO) << __func__ << " created legacy effect handle";
             mContext->setLegacyHandle(mLegacyHandle);
 
+            // libv4a_re only takes the fields flagged in mask, and sizes its work buffer from
+            // the frame count: without them it keeps mismatched defaults (INVALID_FRAME_COUNT).
             effect_config_t config = {};
+            config.inputCfg.mask = EFFECT_CONFIG_SMP_RATE | EFFECT_CONFIG_CHANNELS |
+                                   EFFECT_CONFIG_FORMAT | EFFECT_CONFIG_ACC_MODE |
+                                   EFFECT_CONFIG_BUFFER;
+            config.inputCfg.buffer.frameCount = common.input.frameCount;
             config.inputCfg.samplingRate = common.input.base.sampleRate;
             config.inputCfg.channels = AUDIO_CHANNEL_OUT_STEREO;
             config.inputCfg.format = AUDIO_FORMAT_PCM_FLOAT;
